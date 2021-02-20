@@ -235,7 +235,7 @@ int main()
     params.threshold = 1e-5;
     params.learningRate = 0.001;
 
-    read_data("/home/sabbih_shah/Clion_Projects/Logistic_Regression/training data.txt",
+    read_data("training data.txt",
               height, weight, gender);
 
   //  fill(bias.begin(), bias.end(), 1.0);
@@ -250,7 +250,7 @@ int main()
     gender.clear();
     weight.clear();
 
-    read_data("/home/sabbih_shah/Clion_Projects/Logistic_Regression/testing data.txt",
+    read_data("testing data.txt",
               height, weight, gender);
 
     StandardScaleData(&weight);
