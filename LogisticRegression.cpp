@@ -72,9 +72,8 @@ struct sigmoid { double operator() (double d) const
 
 double findMean(const vector<double>& vec)
 {
-    double total = accumulate(vec.begin(), vec.end(),  );
+    double total = accumulate(vec.begin(), vec.end(), decltype(vec)::value_type(0));
 
-    for (auto i : vec) total += i;
     double mean = total / vec.size();
     return mean;
 }
