@@ -1,0 +1,276 @@
+name: NullRisk Workspace Scan
+
+on:
+  pull_request:
+    paths:
+      - "AGENTS.md"
+      - "AGENTS.override.md"
+      - "CLAUDE.md"
+      - "GEMINI.md"
+      - ".cursorrules"
+      - ".cursor/rules/**"
+      - ".windsurf/**"
+      - "skills/**"
+      - "**/SKILL.md"
+      - "mcp.json"
+      - ".mcp/**"
+      - "claude_desktop_config.json"
+      - "package.json"
+      - "Dockerfile"
+      - "**/*.sh"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write # GitHub OIDC upload auth; no NullRisk token secret needed
+  security-events: write
+  pull-requests: read
+
+# Workspace mode: uploads findings to NullRisk using GitHub Actions OIDC.
+# No NULLRISK_CI_TOKEN secret is required for GitHub App-connected repos.
+env:
+  NULLRISK_API_URL: "https://moodiness-jimmy-reliant.ngrok-free.dev"
+  NULLRISK_OIDC_AUDIENCE: "https://moodiness-jimmy-reliant.ngrok-free.dev"
+  NULLRISK_SCANNER_PACKAGE: ${{ vars.NULLRISK_SCANNER_PACKAGE || '@nullrisk/scanner@latest' }}
+  NULLRISK_FAIL_ON: ${{ vars.NULLRISK_FAIL_ON || 'high' }}
+
+jobs:
+  nullrisk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Report NullRisk workflow start
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          BASE_URL="${NULLRISK_API_URL%/}"
+          AUDIENCE="${NULLRISK_OIDC_AUDIENCE:-$BASE_URL}"
+          export AUDIENCE
+          ENCODED_AUDIENCE="$(node -e 'process.stdout.write(encodeURIComponent(process.env.AUDIENCE))')"
+          OIDC_RESPONSE="$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${ENCODED_AUDIENCE}")"
+          OIDC_TOKEN="$(node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(0,"utf8")).value)' <<< "$OIDC_RESPONSE")"
+          export OIDC_TOKEN
+          node <<'NODE'
+          const fs = require("node:fs");
+          const repoFullName = process.env.GITHUB_REPOSITORY || "unknown/unknown";
+          const [owner = "unknown", name = "unknown"] = repoFullName.split("/");
+          let prNumber;
+          let isPrivate = false;
+          try {
+            const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            prNumber = event.pull_request?.number;
+            isPrivate = Boolean(event.repository?.private);
+          } catch {}
+          const payload = {
+            status: "running",
+            stage: "workflow_start",
+            message: "NullRisk workflow started.",
+            metadata: {
+              repository: { provider: "github", owner, name, fullName: repoFullName, defaultBranch: process.env.GITHUB_BASE_REF || process.env.GITHUB_REF_NAME || "main", private: isPrivate },
+              trigger: process.env.GITHUB_EVENT_NAME || "ci",
+              gitRef: process.env.GITHUB_REF,
+              commitSha: process.env.GITHUB_SHA,
+              prNumber,
+              runUrl: (process.env.GITHUB_SERVER_URL || "https://github.com") + "/" + repoFullName + "/actions/runs/" + process.env.GITHUB_RUN_ID,
+              completedAt: new Date().toISOString()
+            }
+          };
+          fs.writeFileSync("nullrisk-workflow-start.json", JSON.stringify(payload, null, 2));
+          NODE
+          node --input-type=module <<'NODE'
+          import fs from "node:fs/promises";
+          const baseUrl = process.env.NULLRISK_API_URL.replace(/\/$/, "");
+          const body = await fs.readFile("nullrisk-workflow-start.json", "utf8");
+          const response = await fetch(baseUrl + "/api/github/workflows/status", { method: "POST", headers: { authorization: "Bearer " + process.env.OIDC_TOKEN, "content-type": "application/json" }, body });
+          console.log(await response.text());
+          NODE
+
+      - name: Generate NullRisk JSON
+        id: scan_json
+        run: |
+          set -euo pipefail
+          echo "Using NullRisk scanner package: $NULLRISK_SCANNER_PACKAGE"
+          npm exec --yes --package "$NULLRISK_SCANNER_PACKAGE" -- nullrisk scan . --format json > nullrisk.json
+          test -s nullrisk.json
+          node -e 'const fs=require("node:fs"); JSON.parse(fs.readFileSync("nullrisk.json","utf8"));'
+
+      - name: Write NullRisk GitHub summary
+        if: ${{ success() && hashFiles('nullrisk.json') != '' }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+          if (!summaryPath || !fs.existsSync("nullrisk.json")) process.exit(0);
+          const scan = JSON.parse(fs.readFileSync("nullrisk.json", "utf8"));
+          const findings = Array.isArray(scan.findings) ? scan.findings : [];
+          const counts = findings.reduce((acc, finding) => {
+            const key = String(finding.severity || "info").toLowerCase();
+            acc[key] = (acc[key] || 0) + 1;
+            return acc;
+          }, {});
+          const rows = findings.slice(0, 20).map((finding) => {
+            const location = String(finding.filePath || "unknown") + ":" + String(finding.line || 1);
+            const summary = String(finding.title || finding.description || "Finding").replace(/\|/g, "\\|");
+            return "| " + String(finding.severity || "info") + " | " + String(finding.id || "rule") + " | " + location + " | " + summary + " |";
+          }).join("\n");
+          const body = [
+            "## NullRisk scan",
+            "",
+            "**Risk:** " + String(scan.riskLabel || "Clean") + "  ",
+            "**Score:** " + String(scan.score ?? 100) + "/100  ",
+            "**Findings:** " + String(findings.length) + "  ",
+            "**Critical/High/Medium/Low:** " + String(counts.critical || 0) + "/" + String(counts.high || 0) + "/" + String(counts.medium || 0) + "/" + String(counts.low || 0),
+            "",
+            findings.length ? "| Severity | Rule | Location | Summary |" : "No findings detected.",
+            findings.length ? "|---|---|---|---|" : "",
+            rows,
+            findings.length > 20 ? "\n_Showing first 20 of " + String(findings.length) + " findings._" : ""
+          ].filter(Boolean).join("\n");
+          fs.appendFileSync(summaryPath, body + "\n");
+          NODE
+
+      - name: Build NullRisk upload payload
+        if: ${{ success() && hashFiles('nullrisk.json') != '' }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+          const scan = JSON.parse(fs.readFileSync("nullrisk.json", "utf8"));
+          const repoFullName = process.env.GITHUB_REPOSITORY || "unknown/unknown";
+          const [owner = "unknown", name = "unknown"] = repoFullName.split("/");
+          let prNumber;
+          let isPrivate = false;
+          try {
+            const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            prNumber = event.pull_request?.number;
+            isPrivate = Boolean(event.repository?.private);
+          } catch {}
+          const payload = {
+            scan,
+            metadata: {
+              repository: { provider: "github", owner, name, fullName: repoFullName, defaultBranch: process.env.GITHUB_BASE_REF || process.env.GITHUB_REF_NAME || "main", private: isPrivate },
+              trigger: process.env.GITHUB_EVENT_NAME || "ci",
+              source: "ci",
+              gitRef: process.env.GITHUB_REF,
+              commitSha: process.env.GITHUB_SHA,
+              prNumber,
+              runUrl: (process.env.GITHUB_SERVER_URL || "https://github.com") + "/" + repoFullName + "/actions/runs/" + process.env.GITHUB_RUN_ID,
+              engineVersion: scan.engineVersion,
+              completedAt: new Date().toISOString()
+            }
+          };
+          fs.writeFileSync("nullrisk-upload.json", JSON.stringify(payload, null, 2));
+          NODE
+
+      - name: Upload NullRisk workspace results with GitHub OIDC
+        if: ${{ success() && hashFiles('nullrisk-upload.json') != '' }}
+        run: |
+          set -euo pipefail
+          BASE_URL="${NULLRISK_API_URL%/}"
+          AUDIENCE="${NULLRISK_OIDC_AUDIENCE:-$BASE_URL}"
+          export AUDIENCE
+          ENCODED_AUDIENCE="$(node -e 'process.stdout.write(encodeURIComponent(process.env.AUDIENCE))')"
+          OIDC_RESPONSE="$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${ENCODED_AUDIENCE}")"
+          OIDC_TOKEN="$(node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(0,"utf8")).value)' <<< "$OIDC_RESPONSE")"
+          export OIDC_TOKEN
+
+          node --input-type=module <<'NODE'
+          import fs from "node:fs/promises";
+          const baseUrl = process.env.NULLRISK_API_URL.replace(/\/$/, "");
+          const oidcToken = process.env.OIDC_TOKEN;
+          const body = await fs.readFile("nullrisk-upload.json", "utf8");
+          const response = await fetch(baseUrl + "/api/scan-results", { method: "POST", headers: { authorization: "Bearer " + oidcToken, "content-type": "application/json" }, body });
+          const text = await response.text();
+          await fs.writeFile("nullrisk-upload-response.json", text);
+          console.log(text);
+          if (!response.ok) process.exit(1);
+          NODE
+
+      - name: Generate NullRisk SARIF
+        id: scan_sarif
+        if: ${{ success() && hashFiles('nullrisk.json') != '' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          npm exec --yes --package "$NULLRISK_SCANNER_PACKAGE" -- nullrisk scan . --format sarif > nullrisk.sarif
+          test -s nullrisk.sarif
+          node -e 'const fs=require("node:fs"); JSON.parse(fs.readFileSync("nullrisk.sarif","utf8"));'
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v4
+        if: ${{ success() && hashFiles('nullrisk.sarif') != '' }}
+        continue-on-error: true
+        with:
+          sarif_file: nullrisk.sarif
+      - name: Report NullRisk workflow failure
+        if: ${{ failure() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          BASE_URL="${NULLRISK_API_URL%/}"
+          AUDIENCE="${NULLRISK_OIDC_AUDIENCE:-$BASE_URL}"
+          export AUDIENCE
+          ENCODED_AUDIENCE="$(node -e 'process.stdout.write(encodeURIComponent(process.env.AUDIENCE))')"
+          OIDC_RESPONSE="$(curl -sSf -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${ENCODED_AUDIENCE}")"
+          OIDC_TOKEN="$(node -e 'const fs=require("node:fs"); process.stdout.write(JSON.parse(fs.readFileSync(0,"utf8")).value)' <<< "$OIDC_RESPONSE")"
+          export OIDC_TOKEN
+          node <<'NODE'
+          const fs = require("node:fs");
+          const repoFullName = process.env.GITHUB_REPOSITORY || "unknown/unknown";
+          const [owner = "unknown", name = "unknown"] = repoFullName.split("/");
+          let prNumber;
+          let isPrivate = false;
+          try {
+            const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, "utf8"));
+            prNumber = event.pull_request?.number;
+            isPrivate = Boolean(event.repository?.private);
+          } catch {}
+          let stage = "unknown";
+          if (!fs.existsSync("nullrisk.json")) stage = "scan_json";
+          else if (!fs.existsSync("nullrisk-upload-response.json")) stage = fs.existsSync("nullrisk-upload.json") ? "upload_results" : "build_upload_payload";
+          else if (!fs.existsSync("nullrisk.sarif")) stage = "scan_sarif";
+          const payload = {
+            status: "failed",
+            stage,
+            message: "NullRisk workflow failed before a successful workspace scan upload or SARIF upload completed.",
+            metadata: {
+              repository: { provider: "github", owner, name, fullName: repoFullName, defaultBranch: process.env.GITHUB_BASE_REF || process.env.GITHUB_REF_NAME || "main", private: isPrivate },
+              trigger: process.env.GITHUB_EVENT_NAME || "ci",
+              gitRef: process.env.GITHUB_REF,
+              commitSha: process.env.GITHUB_SHA,
+              prNumber,
+              runUrl: (process.env.GITHUB_SERVER_URL || "https://github.com") + "/" + repoFullName + "/actions/runs/" + process.env.GITHUB_RUN_ID,
+              completedAt: new Date().toISOString()
+            }
+          };
+          fs.writeFileSync("nullrisk-workflow-status.json", JSON.stringify(payload, null, 2));
+          NODE
+          node --input-type=module <<'NODE'
+          import fs from "node:fs/promises";
+          const baseUrl = process.env.NULLRISK_API_URL.replace(/\/$/, "");
+          const body = await fs.readFile("nullrisk-workflow-status.json", "utf8");
+          const response = await fetch(baseUrl + "/api/github/workflows/status", { method: "POST", headers: { authorization: "Bearer " + process.env.OIDC_TOKEN, "content-type": "application/json" }, body });
+          console.log(await response.text());
+          NODE
+
+      - name: Enforce NullRisk uploaded policy decision
+        if: ${{ always() && hashFiles('nullrisk-upload-response.json') != '' }}
+        run: |
+          node - <<'NODE'
+          const fs = require("node:fs");
+          const parsed = JSON.parse(fs.readFileSync("nullrisk-upload-response.json", "utf8"));
+          if (parsed.decision?.decision === "block") {
+            console.error("NullRisk Workspace policy blocked this run.");
+            process.exit(1);
+          }
+          NODE
+
+      - name: Enforce NullRisk local fallback policy
+        if: ${{ failure() && hashFiles('nullrisk.json') != '' && hashFiles('nullrisk-upload-response.json') == '' }}
+        run: npm exec --yes --package "$NULLRISK_SCANNER_PACKAGE" -- nullrisk scan . --fail-on "$NULLRISK_FAIL_ON"
